@@ -2751,7 +2751,38 @@ void llama_context::opt_epoch_iter(
                 llama_coconut_set_latent(-1, nullptr, 0);
             }
 
-            auto * gf = model.build_graph(gparams);
+            // Coconut путь A ИНК-3 (gradient-flow): 2 саб-графа в одном ctx — build0 (без латента) даёт
+            // result_norm_0 узел; build1 инъектит его (колонка slot-1) в slot как УЗЕЛ (НЕ detach) →
+            // backward течёт CE→латент→result_norm_0→LoRA. res аккумулирует инпуты обоих build →
+            // set_inputs(&ubatch) заполнит оба (решает dual-input). env LLAMA_COCONUT_INK3, default-off.
+            const bool coco_ink3 = (getenv("LLAMA_COCONUT_INK3") != nullptr);
+            int ink3_slot = -1;
+            if (coco_ink3) {
+                for (uint32_t p = 0; p < n_ubatch; ++p) {
+                    const uint32_t im = pos_ctx + pos_batch + p;
+                    if (im < masks_sparse.size() && masks_sparse[im] == 1) { ink3_slot = (int) p; break; }
+                }
+            }
+            ggml_cgraph * gf = nullptr;
+            if (coco_ink3 && ink3_slot > 0) {
+                llama_coconut_set_latent_node(nullptr, -1, -1);
+                llama_coconut_set_latent(-1, nullptr, 0);
+                ggml_cgraph * gf0 = model.build_graph(gparams);
+                ggml_tensor * rn0 = nullptr;
+                for (int ni = 0; ni < ggml_graph_n_nodes(gf0); ++ni) {
+                    ggml_tensor * nd = ggml_graph_node(gf0, ni);
+                    if (nd && strcmp(nd->name, "result_norm") == 0 && nd->ne[0] == coco_nembd) { rn0 = nd; break; }
+                }
+                if (rn0) {
+                    llama_coconut_set_latent_node(rn0, ink3_slot - 1, ink3_slot);
+                    gf = model.build_graph(gparams);              // build1 с node-инъекцией
+                    llama_coconut_set_latent_node(nullptr, -1, -1);
+                } else {
+                    gf = gf0;                                      // fallback: result_norm не найден
+                }
+            } else {
+                gf = model.build_graph(gparams);
+            }
 
             struct ggml_context * ctx_compute_opt;
             {

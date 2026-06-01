@@ -2110,8 +2110,8 @@ ggml_opt_dataset_t common_opt_sft_dataset_init(
         // Coconut путь A (ИНК-2): вставить DEDICATED latent-slot перед первым assistant-токеном.
         // placeholder перезапишется захваченным result_norm в opt_epoch_iter (causal-чистый capture);
         // masks[slot]=(sample_mask[slot+1]==1)=1 → латент-позиция получает loss за первый ответ-токен.
-        // env LLAMA_COCONUT_LATENT (выкл по умолчанию = регресс-безопасно).
-        if (getenv("LLAMA_COCONUT_LATENT")) {
+        // env LLAMA_COCONUT_LATENT (ИНК-2) ИЛИ LLAMA_COCONUT_INK3 (ИНК-3) — оба нужен data-slot. выкл=регресс.
+        if (getenv("LLAMA_COCONUT_LATENT") || getenv("LLAMA_COCONUT_INK3")) {
             size_t first_ast = 0; bool found = false;
             for (size_t t = 0; t < assistant_mask.size(); ++t) {
                 if (assistant_mask[t] == 1) { first_ast = t; found = true; break; }

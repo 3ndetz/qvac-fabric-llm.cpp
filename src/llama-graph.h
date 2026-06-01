@@ -20,6 +20,10 @@ struct llama_cparams;
 
 struct llama_memory_context_i;
 
+// Coconut путь A (ИНК-2): задать/снять detached-латент для инъекции в build_inp_embd.
+// pos<0 = выкл (дефолт, регресс-безопасно). data = n_embd_inp float (захваченный result_norm).
+void llama_coconut_set_latent(int pos, const float * data, int n);
+
 class llama_kv_cache_context;
 class llama_kv_cache_iswa_context;
 class llama_memory_recurrent_context;
@@ -117,6 +121,20 @@ public:
     ggml_tensor * embd   = nullptr; // F32 [n_embd, n_batch]
 
     const int64_t n_embd = 0;
+};
+
+// Coconut путь A (ИНК-2 detached): инъекция захваченного latent (result_norm) в одну позицию embd-входа.
+// Данные берутся из файл-статика (llama_coconut_set_latent), set_input заливает в граф-тензор.
+class llm_graph_input_coconut_latent : public llm_graph_input_i {
+public:
+    llm_graph_input_coconut_latent(int64_t n_embd_inp) : n_embd_inp(n_embd_inp) {}
+    virtual ~llm_graph_input_coconut_latent() = default;
+
+    void set_input(const llama_ubatch * ubatch) override;
+
+    ggml_tensor * latent = nullptr; // F32 [n_embd_inp, 1]
+
+    const int64_t n_embd_inp = 0;
 };
 
 class llm_graph_input_pos : public llm_graph_input_i {

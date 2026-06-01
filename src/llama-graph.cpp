@@ -52,6 +52,22 @@ static bool can_reuse_kq_mask(
 
 // impl
 
+// Coconut путь A (ИНК-2 detached): файл-статик с захваченным латентом + позицией инъекции.
+static int                g_coco_lat_pos  = -1;   // -1 = выкл (дефолт)
+static std::vector<float> g_coco_lat_data;        // n_embd_inp значений (result_norm)
+void llama_coconut_set_latent(int pos, const float * data, int n) {
+    g_coco_lat_pos = pos;
+    if (pos >= 0 && data && n > 0) g_coco_lat_data.assign(data, data + n);
+    else                          g_coco_lat_data.clear();
+}
+
+void llm_graph_input_coconut_latent::set_input(const llama_ubatch * /*ubatch*/) {
+    if (latent && !g_coco_lat_data.empty()) {
+        const size_t n = std::min((size_t)latent->ne[0], g_coco_lat_data.size());
+        ggml_backend_tensor_set(latent, g_coco_lat_data.data(), 0, n * ggml_element_size(latent));
+    }
+}
+
 void llm_graph_input_embd::set_input(const llama_ubatch * ubatch) {
     if (ubatch->token) {
         const int64_t n_tokens = ubatch->n_tokens;
@@ -1563,6 +1579,18 @@ ggml_tensor * llm_graph_context::build_inp_embd(ggml_tensor * tok_embd) const {
     assert(ggml_are_same_stride(inps[0], inps[1]));
 
     ggml_tensor * cur = ggml_build_forward_select(gf, inps.data(), inps.size(), ubatch.token ? 0 : 1);
+
+    // Coconut путь A (ИНК-2 detached): перезаписать одну позицию captured-латентом (result_norm).
+    // detached = латент-вход = leaf-константа (нет градиента в его производство); CE-сигнал учит LoRA
+    // ИСПОЛЬЗОВАТЬ латент. g_coco_lat_pos<0 (дефолт) → блок пропущен, регресс-безопасно.
+    if (g_coco_lat_pos >= 0 && g_coco_lat_pos < (int) n_tokens && !g_coco_lat_data.empty()) {
+        auto linp = std::make_unique<llm_graph_input_coconut_latent>(n_embd_inp);
+        linp->latent = ggml_new_tensor_2d(ctx0, GGML_TYPE_F32, n_embd_inp, 1);
+        cb(linp->latent, "coconut_latent", -1);
+        ggml_set_input(linp->latent);
+        cur = ggml_set_2d(ctx0, cur, linp->latent, cur->nb[1], (size_t) g_coco_lat_pos * cur->nb[1]);
+        res->add_input(std::move(linp));
+    }
 
     if (n_embd_inp != n_embd) {
         cur = ggml_view_2d(ctx0, cur, n_embd, n_tokens, cur->nb[1], 0);

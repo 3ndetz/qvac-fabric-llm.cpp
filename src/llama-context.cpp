@@ -2723,6 +2723,34 @@ void llama_context::opt_epoch_iter(
 
             res->reset();
 
+            // Coconut путь A ИНК-2 (пис B, ЛАГ-ЭПОХА detached): инъекция латента ДО build_graph.
+            // latent = result_norm того же примера из ПРЕДЫДУЩЕЙ эпохи (1-я эпоха = нули). single-pass,
+            // без re-alloc. slot = первая masks_sparse==1 (латент-поза, предсказывает 1-й ответ-токен).
+            // Включается env LLAMA_COCONUT_LATENT (синхр. с data-slot в common_opt_sft_dataset_init).
+            static std::map<int64_t, std::vector<float>> g_coco_epoch_lat;  // idata → result_norm
+            const int     coco_nembd = (int) model.hparams.n_embd;
+            const bool    coco_on    = (getenv("LLAMA_COCONUT_LATENT") != nullptr);
+            int           coco_slot  = -1;
+            if (coco_on) {
+                for (uint32_t p = 0; p < n_ubatch; ++p) {
+                    const uint32_t im = pos_ctx + pos_batch + p;
+                    if (im < masks_sparse.size() && masks_sparse[im] == 1) { coco_slot = (int) p; break; }
+                }
+                if (coco_slot > 0) {
+                    auto it = g_coco_epoch_lat.find(idata_in_loop);
+                    if (it != g_coco_epoch_lat.end() && (int) it->second.size() == coco_nembd) {
+                        llama_coconut_set_latent(coco_slot, it->second.data(), coco_nembd);
+                    } else {
+                        std::vector<float> z(coco_nembd, 0.0f);  // 1-я эпоха: нули
+                        llama_coconut_set_latent(coco_slot, z.data(), coco_nembd);
+                    }
+                } else {
+                    llama_coconut_set_latent(-1, nullptr, 0);
+                }
+            } else {
+                llama_coconut_set_latent(-1, nullptr, 0);
+            }
+
             auto * gf = model.build_graph(gparams);
 
             struct ggml_context * ctx_compute_opt;
@@ -2791,6 +2819,25 @@ void llama_context::opt_epoch_iter(
                 }
             }
             ggml_opt_eval(opt_ctx, result);
+
+            // Coconut пис B: захват result_norm@(slot-1) (последний промпт-токен, causal-чистый —
+            // не аттендит латент-slot) → латент для СЛЕДУЮЩЕЙ эпохи того же примера.
+            if (coco_on && coco_slot > 0) {
+                ggml_tensor * rn = nullptr;
+                for (int ni = 0; ni < ggml_graph_n_nodes(gf); ++ni) {
+                    ggml_tensor * nd = ggml_graph_node(gf, ni);
+                    if (nd && strcmp(nd->name, "result_norm") == 0 && nd->ne[0] == coco_nembd) { rn = nd; break; }
+                }
+                if (rn && (coco_slot - 1) < (int) rn->ne[1]) {
+                    ggml_backend_sched_synchronize(get_sched());
+                    std::vector<float> buf(coco_nembd);
+                    ggml_backend_tensor_get(rn, buf.data(),
+                        (size_t)(coco_slot - 1) * coco_nembd * sizeof(float),
+                        (size_t) coco_nembd * sizeof(float));
+                    g_coco_epoch_lat[idata_in_loop] = std::move(buf);
+                }
+            }
+
             if (callback) {
                 callback(train, opt_ctx, dataset, result, idata_in_loop + (pos_ctx + pos_batch)/n_ubatch + 1, ndata_in_loop, t_loop_start);
             }

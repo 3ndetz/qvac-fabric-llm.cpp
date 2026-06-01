@@ -62,11 +62,14 @@ void llama_coconut_set_latent(int pos, const float * data, int n) {
 }
 
 // ИНК-3: латент как ggml-УЗЕЛ (не detach). node!=null имеет приоритет над CPU-латентом.
+// node = result_norm [n_embd, n_tokens]; вьюшим колонку src_pos → инъектим в dst_pos.
 static ggml_tensor * g_coco_lat_node = nullptr;
-static int           g_coco_lat_node_pos = -1;
-void llama_coconut_set_latent_node(ggml_tensor * node, int pos) {
-    g_coco_lat_node = node;
-    g_coco_lat_node_pos = node ? pos : -1;
+static int           g_coco_lat_node_src = -1;  // откуда брать колонку (slot-1)
+static int           g_coco_lat_node_pos = -1;  // куда инъектить (slot)
+void llama_coconut_set_latent_node(ggml_tensor * node, int src_pos, int dst_pos) {
+    g_coco_lat_node     = node;
+    g_coco_lat_node_src = node ? src_pos : -1;
+    g_coco_lat_node_pos = node ? dst_pos : -1;
 }
 
 void llm_graph_input_coconut_latent::set_input(const llama_ubatch * /*ubatch*/) {
@@ -1590,8 +1593,12 @@ ggml_tensor * llm_graph_context::build_inp_embd(ggml_tensor * tok_embd) const {
 
     // Coconut путь A (ИНК-3 gradient-flow): инъекция латента как ggml-УЗЕЛ (result_norm пред.саб-графа),
     // НЕ detach → backward течёт в производство латента. Приоритет над CPU-латентом. node = [n_embd_inp,1].
-    if (g_coco_lat_node && g_coco_lat_node_pos >= 0 && g_coco_lat_node_pos < (int) n_tokens) {
-        cur = ggml_set_2d(ctx0, cur, g_coco_lat_node, cur->nb[1], (size_t) g_coco_lat_node_pos * cur->nb[1]);
+    if (g_coco_lat_node && g_coco_lat_node_pos >= 0 && g_coco_lat_node_pos < (int) n_tokens
+            && g_coco_lat_node_src >= 0 && g_coco_lat_node_src < (int) g_coco_lat_node->ne[1]) {
+        // вьюшим колонку src_pos из result_norm [n_embd, n_tokens] → [n_embd, 1], инъектим в dst_pos
+        ggml_tensor * lat = ggml_view_2d(ctx0, g_coco_lat_node, g_coco_lat_node->ne[0], 1,
+                                         g_coco_lat_node->nb[1], (size_t) g_coco_lat_node_src * g_coco_lat_node->nb[1]);
+        cur = ggml_set_2d(ctx0, cur, lat, cur->nb[1], (size_t) g_coco_lat_node_pos * cur->nb[1]);
     } else
     // Coconut путь A (ИНК-2 detached): перезаписать одну позицию captured-латентом (result_norm).
     // detached = латент-вход = leaf-константа (нет градиента в его производство); CE-сигнал учит LoRA

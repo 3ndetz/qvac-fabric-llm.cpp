@@ -25,8 +25,10 @@ struct llama_memory_context_i;
 void llama_coconut_set_latent(int pos, const float * data, int n);
 
 // Coconut путь A (ИНК-3 gradient-flow): инъекция латента как ggml-УЗЕЛ (result_norm пред.саб-графа),
-// НЕ detach → градиент течёт в производство латента. node=nullptr = выкл. node = [n_embd_inp, 1] view.
-void llama_coconut_set_latent_node(struct ggml_tensor * node, int pos);
+// НЕ detach → градиент течёт в производство латента. node=nullptr = выкл.
+// node = result_norm [n_embd, n_tokens] (полный); src_pos = откуда брать колонку (slot-1, последний промпт-
+// токен, causal-чист); dst_pos = куда инъектить (slot). build_inp_embd вьюшит колонку src_pos и пишет в dst_pos.
+void llama_coconut_set_latent_node(struct ggml_tensor * node, int src_pos, int dst_pos);
 
 class llama_kv_cache_context;
 class llama_kv_cache_iswa_context;

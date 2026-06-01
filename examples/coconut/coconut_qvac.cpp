@@ -44,15 +44,28 @@ static void print_lens(struct llama_context * ctx, const struct llama_vocab * vo
         printf("'%s'(%.0f%%) ", tok.c_str(), p * 100.0);
     }
     printf("\n");
-    // дамп вероятностей цифр 0-9 (полновокабный softmax) для heatmap-визуализации латентной траектории
-    if (g_dump && (int)g_digit_ids.size() == 10) {
-        double mxall = logits[0];
-        for (int i = 1; i < n_vocab; i++) if (logits[i] > mxall) mxall = logits[i];
-        double Z = 0.0; for (int i = 0; i < n_vocab; i++) Z += exp((double)logits[i] - mxall);
-        if (Z <= 0) Z = 1.0;
-        fprintf(g_dump, "%d", step);
-        for (int d = 0; d < 10; d++) fprintf(g_dump, ",%.6f", exp((double)logits[g_digit_ids[d]] - mxall) / Z);
-        fprintf(g_dump, "\n");
+    // дамп JSON-строки: top-12 РЕАЛЬНЫХ токенов (слов) + softmax-вероятность = «облако смысла» шага (для виз слов)
+    if (g_dump) {
+        int kk = 12; if (kk > n_vocab) kk = n_vocab;
+        double s2 = 0.0; for (int i = 0; i < kk; i++) s2 += exp((double)logits[idx[i]] - mx);
+        fprintf(g_dump, "{\"step\":%d,\"top\":[", step);
+        for (int i = 0; i < kk; i++) {
+            char buf[128];
+            int n = llama_token_to_piece(vocab, idx[i], buf, sizeof(buf), 0, true);
+            std::string tok(buf, n > 0 ? n : 0);
+            std::string esc;  // JSON-экранирование
+            for (char ch : tok) {
+                if (ch == '"' || ch == '\\') { esc += '\\'; esc += ch; }
+                else if (ch == '\n') esc += "\\n";
+                else if (ch == '\r') esc += "\\r";
+                else if (ch == '\t') esc += "\\t";
+                else if ((unsigned char)ch < 0x20) { }  // пропустить прочие управляющие
+                else esc += ch;
+            }
+            double p = exp((double)logits[idx[i]] - mx) / (s2 > 0 ? s2 : 1.0);
+            fprintf(g_dump, "%s[\"%s\",%.4f]", i ? "," : "", esc.c_str(), p);
+        }
+        fprintf(g_dump, "]}\n");
     }
 }
 static int   g_nembd = 0;
@@ -159,7 +172,6 @@ int main(int argc, char ** argv) {
             int nt = llama_tokenize(vocab, ds.c_str(), ds.size(), tt, 4, false, false);
             g_digit_ids[d] = nt > 0 ? tt[nt - 1] : 0;
         }
-        fprintf(g_dump, "step,d0,d1,d2,d3,d4,d5,d6,d7,d8,d9\n");
     }
 
     // tokenize

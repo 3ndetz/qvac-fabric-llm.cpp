@@ -3,6 +3,7 @@
 #include "log.h"
 #include "llama.h"
 #include "ggml-backend.h"
+#include "ggml-opt.h"  // ggml_opt_set_loss_scale (намордники: scale<0 = unlearn/ascent)
 
 #include <algorithm>
 #include <cctype>
@@ -504,6 +505,7 @@ struct finetune_params {
     std::string chat_template_path;
     bool assistant_loss_only = false;
     uint32_t lora_seed = 42;
+    float loss_scale = 1.0f;  // намордники: <0 = negative push (unlearn/ascent, разучивание плохого поведения)
 };
 
 static bool parse_finetune_args(int& argc, char** argv, finetune_params& ft_params) {
@@ -525,6 +527,15 @@ static bool parse_finetune_args(int& argc, char** argv, finetune_params& ft_para
         if (strcmp(argv[i], "--assistant-loss-only") == 0) {
             ft_params.assistant_loss_only = true;
             remove_arg_single(i);
+            i--;
+        }
+    }
+
+    // намордники: --loss-scale S (S<0 = unlearn/ascent, разучивание плохого поведения в весах без regex)
+    for (int i = 1; i < argc; i++) {
+        if (strcmp(argv[i], "--loss-scale") == 0 && i + 1 < argc) {
+            ft_params.loss_scale = (float) std::atof(argv[i + 1]);
+            remove_arg_pair(i);
             i--;
         }
     }
@@ -878,6 +889,13 @@ int main(int argc, char ** argv) {
     lopt_params.checkpoint_path      = checkpoint_loaded ? optimizer_checkpoint_path.c_str() : nullptr;
     lopt_params.load_optimizer_state = checkpoint_loaded;
     lopt_params.assistant_loss_only  = ft_params.assistant_loss_only;
+
+    // намордники: установить масштаб лосса ПЕРЕД opt_init (scale<0 = ascent/unlearn; 1.0 = обычное обучение)
+    ggml_opt_set_loss_scale(ft_params.loss_scale);
+    if (ft_params.loss_scale != 1.0f) {
+        LOG_INF("%s: loss_scale=%.3f (%s)\n", __func__, ft_params.loss_scale,
+                ft_params.loss_scale < 0.0f ? "НАМОРДНИК: negative push / unlearn" : "scaled");
+    }
 
     llama_opt_init(ctx, model, lopt_params);
     

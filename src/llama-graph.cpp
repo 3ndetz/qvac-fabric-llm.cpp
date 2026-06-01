@@ -61,6 +61,14 @@ void llama_coconut_set_latent(int pos, const float * data, int n) {
     else                          g_coco_lat_data.clear();
 }
 
+// ИНК-3: латент как ggml-УЗЕЛ (не detach). node!=null имеет приоритет над CPU-латентом.
+static ggml_tensor * g_coco_lat_node = nullptr;
+static int           g_coco_lat_node_pos = -1;
+void llama_coconut_set_latent_node(ggml_tensor * node, int pos) {
+    g_coco_lat_node = node;
+    g_coco_lat_node_pos = node ? pos : -1;
+}
+
 void llm_graph_input_coconut_latent::set_input(const llama_ubatch * /*ubatch*/) {
     if (latent && !g_coco_lat_data.empty()) {
         const size_t n = std::min((size_t)latent->ne[0], g_coco_lat_data.size());
@@ -1580,6 +1588,11 @@ ggml_tensor * llm_graph_context::build_inp_embd(ggml_tensor * tok_embd) const {
 
     ggml_tensor * cur = ggml_build_forward_select(gf, inps.data(), inps.size(), ubatch.token ? 0 : 1);
 
+    // Coconut путь A (ИНК-3 gradient-flow): инъекция латента как ggml-УЗЕЛ (result_norm пред.саб-графа),
+    // НЕ detach → backward течёт в производство латента. Приоритет над CPU-латентом. node = [n_embd_inp,1].
+    if (g_coco_lat_node && g_coco_lat_node_pos >= 0 && g_coco_lat_node_pos < (int) n_tokens) {
+        cur = ggml_set_2d(ctx0, cur, g_coco_lat_node, cur->nb[1], (size_t) g_coco_lat_node_pos * cur->nb[1]);
+    } else
     // Coconut путь A (ИНК-2 detached): перезаписать одну позицию captured-латентом (result_norm).
     // detached = латент-вход = leaf-константа (нет градиента в его производство); CE-сигнал учит LoRA
     // ИСПОЛЬЗОВАТЬ латент. g_coco_lat_pos<0 (дефолт) → блок пропущен, регресс-безопасно.

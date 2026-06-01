@@ -2050,59 +2050,31 @@ ggml_opt_dataset_t common_opt_sft_dataset_init(
         struct Span { size_t lo, hi; };
         std::vector<Span> assistant_spans;
 
+        // Model-AGNOSTIC assistant-span detection: locate each assistant message's CONTENT
+        // verbatim inside the template-rendered text. Works for ANY chat template (gemma3
+        // "<start_of_turn>model", gemma4 "<|turn>model", ChatML "<|im_start|>assistant", ...)
+        // without hardcoding turn markers — the render already used the model's native template.
+        // Each span is extended to the end of its line so the turn terminator is also supervised
+        // (the model learns to stop).
         {
-            bool is_gemma = render.find("<start_of_turn>model\n") != std::string::npos;
-
-            if (is_gemma) {
-                const std::string GEMMA_START = "<start_of_turn>model\n";
-                const std::string GEMMA_END = "<end_of_turn>";
-
-                size_t from = 0;
-                while (true) {
-                    size_t open = render.find(GEMMA_START, from);
-                    if (open == std::string::npos) break;
-                    // Skip past "<start_of_turn>model\n" — supervise content only, not the role header
-                    size_t lo = open + GEMMA_START.size();
-                    size_t close = render.find(GEMMA_END, lo);
-                    if (close == std::string::npos) {
-                        assistant_spans.push_back({lo, render.size()});
-                        break;
-                    }
-
-                    size_t hi = close + GEMMA_END.size();
-                    assistant_spans.push_back({lo, std::min(hi, render.size())});
-
-                    from = hi;
+            size_t search_from = 0;
+            for (const auto & msg : messages) {
+                if (!msg.contains("role") || !msg.contains("content")) continue;
+                if (msg["role"].get<std::string>() != "assistant") continue;
+                std::string content = msg["content"].get<std::string>();
+                while (!content.empty() && (content.back() == '\n' || content.back() == '\r' || content.back() == ' ')) {
+                    content.pop_back();
                 }
-            } else {
-                size_t from = 0;
-                while (true) {
-                    size_t open = render.find(START_AST, from);
-                    if (open == std::string::npos) break;
-
-                    // Skip past "<|im_start|>assistant\n" — supervise content only, not the role header
-                    size_t lo = open + START_AST.size();
-                    if (lo > render.size()) {
-                        lo = render.size();
-                    }
-
-                    size_t close = render.find(END_TAG, open + START_AST.size());
-                    if (close == std::string::npos) {
-                        assistant_spans.push_back({lo, render.size()});
-                        break;
-                    }
-
-                    size_t hi = close + END_TAG.size();
-                    if (hi <= lo) {
-                        lo = open;
-                        hi = close + END_TAG.size();
-                    }
-
-                    assistant_spans.push_back({lo, std::min(hi, render.size())});
-
-                    size_t next_from = hi;
-                    from = next_from;
-                }
+                if (content.empty()) continue;
+                size_t pos = render.find(content, search_from);
+                if (pos == std::string::npos) pos = render.find(content);  // fallback: search whole render
+                if (pos == std::string::npos) continue;                    // content transformed by template — skip
+                size_t lo = pos;
+                size_t hi = pos + content.size();
+                size_t nl = render.find('\n', hi);                         // include turn terminator (e.g. <end_of_turn>/<turn|>) up to EOL
+                if (nl != std::string::npos && nl - hi < 32) hi = nl + 1;
+                assistant_spans.push_back({lo, std::min(hi, render.size())});
+                search_from = hi;
             }
         }
 
@@ -2133,6 +2105,23 @@ ggml_opt_dataset_t common_opt_sft_dataset_init(
         if (assistant_token_count == 0) {
             LOG_WRN("Warning: Conversation %zu has zero assistant tokens after masking\n", i);
             continue;
+        }
+
+        // Coconut путь A (ИНК-2): вставить DEDICATED latent-slot перед первым assistant-токеном.
+        // placeholder перезапишется захваченным result_norm в opt_epoch_iter (causal-чистый capture);
+        // masks[slot]=(sample_mask[slot+1]==1)=1 → латент-позиция получает loss за первый ответ-токен.
+        // env LLAMA_COCONUT_LATENT (выкл по умолчанию = регресс-безопасно).
+        if (getenv("LLAMA_COCONUT_LATENT")) {
+            size_t first_ast = 0; bool found = false;
+            for (size_t t = 0; t < assistant_mask.size(); ++t) {
+                if (assistant_mask[t] == 1) { first_ast = t; found = true; break; }
+            }
+            if (found && first_ast > 0) {
+                llama_token slot_tok = llama_vocab_eos(vocab);
+                if (slot_tok == LLAMA_TOKEN_NULL) slot_tok = 0;
+                tokens_full.insert(tokens_full.begin() + first_ast, slot_tok);
+                assistant_mask.insert(assistant_mask.begin() + first_ast, 0);
+            }
         }
 
         all_tokenized_data.push_back(tokens_full);

@@ -19,6 +19,7 @@ static FILE* g_dump  = nullptr;          // --lens-dump FILE: CSV вероятн
 static std::vector<llama_token> g_digit_ids;  // токен-id цифр '0'..'9' (заполняется в main)
 static int   g_soft  = 0;     // --soft K: soft-token feedback (Σ p_i·embd top-K вместо сырого hidden); 0=выкл
 static int   g_raw   = 0;     // --raw: БЕЗ chat-wrap (completion-режим — genuine-мысль = сам концепт, не фрейм ответа)
+static std::string g_lora;    // --lora PATH: применить LoRA-адаптер (тест: обученная модель + латенты)
 
 // logit-lens (tuned-lens-lite): после decode латентного шага логиты УЖЕ посчитаны нашим lm_head (eb.logits=true).
 // Печатаем топ-k токенов с softmax-вероятностью = «о чём думает модель в этом латенте». НЕ внешняя модель — наш own head.
@@ -152,6 +153,7 @@ int main(int argc, char ** argv) {
         else if (a == "--lens-dump" && i + 1 < argc) { g_lens = 1; g_dump = fopen(argv[++i], "w"); }
         else if (a == "--soft" && i + 1 < argc) g_soft = std::stoi(argv[++i]);
         else if (a == "--raw") g_raw = 1;
+        else if (a == "--lora" && i + 1 < argc) g_lora = argv[++i];
         else { prompt = a; for (++i; i < argc; i++) { prompt += " "; prompt += argv[i]; } break; }
     }
     if (model_path.empty() || prompt.empty()) { usage(argv[0]); return 1; }
@@ -196,6 +198,15 @@ int main(int argc, char ** argv) {
     else if (K > 0)  { cp.cb_eval = capture_cb; cp.cb_eval_user_data = &cbdata; }   // K>0: ловить result_norm
     llama_context * ctx = llama_init_from_model(model, cp);
     if (!ctx) { fprintf(stderr, "ctx fail\n"); return 1; }
+
+    // --lora: применить адаптер (тест пути A — обученные веса + латенты)
+    if (!g_lora.empty()) {
+        llama_adapter_lora * la = llama_adapter_lora_init(model, g_lora.c_str());
+        if (!la) { fprintf(stderr, "lora load fail: %s\n", g_lora.c_str()); return 1; }
+        llama_adapter_lora * adapters[1] = { la }; float scales[1] = { 1.0f };
+        llama_set_adapters_lora(ctx, adapters, 1, scales);
+        fprintf(stderr, "[lora] applied: %s\n", g_lora.c_str());
+    }
 
     auto sp = llama_sampler_chain_default_params();
     llama_sampler * smpl = llama_sampler_chain_init(sp);

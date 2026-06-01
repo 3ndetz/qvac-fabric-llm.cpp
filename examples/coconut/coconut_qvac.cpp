@@ -18,6 +18,7 @@ static int   g_lens  = 0;     // --lens: logit-lens превью латенто�
 static FILE* g_dump  = nullptr;          // --lens-dump FILE: CSV вероятностей цифр 0-9 по шагам (для heatmap-визуализации)
 static std::vector<llama_token> g_digit_ids;  // токен-id цифр '0'..'9' (заполняется в main)
 static int   g_soft  = 0;     // --soft K: soft-token feedback (Σ p_i·embd top-K вместо сырого hidden); 0=выкл
+static int   g_raw   = 0;     // --raw: БЕЗ chat-wrap (completion-режим — genuine-мысль = сам концепт, не фрейм ответа)
 
 // logit-lens (tuned-lens-lite): после decode латентного шага логиты УЖЕ посчитаны нашим lm_head (eb.logits=true).
 // Печатаем топ-k токенов с softmax-вероятностью = «о чём думает модель в этом латенте». НЕ внешняя модель — наш own head.
@@ -150,10 +151,11 @@ int main(int argc, char ** argv) {
         else if (a == "--lens") g_lens = 1;
         else if (a == "--lens-dump" && i + 1 < argc) { g_lens = 1; g_dump = fopen(argv[++i], "w"); }
         else if (a == "--soft" && i + 1 < argc) g_soft = std::stoi(argv[++i]);
+        else if (a == "--raw") g_raw = 1;
         else { prompt = a; for (++i; i < argc; i++) { prompt += " "; prompt += argv[i]; } break; }
     }
     if (model_path.empty() || prompt.empty()) { usage(argv[0]); return 1; }
-    prompt = "<start_of_turn>user\n" + prompt + "<end_of_turn>\n<start_of_turn>model\n";  // gemma chat-wrap
+    if (!g_raw) prompt = "<start_of_turn>user\n" + prompt + "<end_of_turn>\n<start_of_turn>model\n";  // gemma chat-wrap (если не --raw)
 
     ggml_backend_load_all();
     llama_model_params mp = llama_model_default_params();

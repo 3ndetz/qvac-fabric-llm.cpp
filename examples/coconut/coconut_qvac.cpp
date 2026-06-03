@@ -134,8 +134,117 @@ static bool compute_soft(struct llama_context * ctx, const struct llama_vocab * 
     return true;
 }
 
+static std::string g_prompts_file;  // --prompts-file PATH: батч-режим, по 1 промпту на строку (модель грузится РАЗ)
+
 static void usage(const char * a0) {
-    printf("\n  %s -m model.gguf [-k K_latent=2] [-n n_predict=32] [-ngl 999] \"prompt\"\n", a0);
+    printf("\n  %s -m model.gguf [-k K_latent=2] [-n n_predict=32] [-ngl 999] [--prompts-file f.txt] \"prompt\"\n", a0);
+}
+
+// run_one: полный латент-проход ОДНОГО промпта (модель+адаптер уже загружены РАЗ).
+// single-prompt путь = run_one на 1 промпте (поведение идентично прежнему main). Возвращает 0/код.
+static int run_one(struct llama_model * model, const struct llama_vocab * vocab, int n_embd,
+                   const std::string & raw_prompt, int K, int n_predict, struct llama_adapter_lora * la) {
+    std::string prompt = raw_prompt;
+    if (!g_raw) prompt = "<start_of_turn>user\n" + prompt + "<end_of_turn>\n<start_of_turn>model\n";  // gemma chat-wrap
+
+    // tokenize
+    int n_prompt = -llama_tokenize(vocab, prompt.c_str(), prompt.size(), NULL, 0, true, true);
+    std::vector<llama_token> toks(n_prompt);
+    if (llama_tokenize(vocab, prompt.c_str(), prompt.size(), toks.data(), toks.size(), true, true) < 0) {
+        fprintf(stderr, "tok fail\n"); return 1;
+    }
+
+    // ctx размер ЗАВИСИТ от n_prompt → пере-создаём per-prompt (gotcha batch-режима)
+    llama_context_params cp = llama_context_default_params();
+    cp.n_ctx   = n_prompt + K + n_predict + 8;
+    cp.n_batch = n_prompt + 8;
+    cp.embeddings    = false;
+    cp.pooling_type  = LLAMA_POOLING_TYPE_UNSPECIFIED;
+    g_nembd = n_embd;
+    CocoCB cbdata; cbdata.h.resize(n_embd); cbdata.n_embd = n_embd; cbdata.got = false;  // ЛОКАЛЬНАЯ (per-prompt чистая)
+    cbdata.embd_capture = false; cbdata.embd_got = false; cbdata.embd_k = 0;
+    if (g_names)     { cp.cb_eval = names_cb;   cp.cb_eval_user_data = nullptr; }
+    else if (K > 0)  { cp.cb_eval = capture_cb; cp.cb_eval_user_data = &cbdata; }
+    llama_context * ctx = llama_init_from_model(model, cp);
+    if (!ctx) { fprintf(stderr, "ctx fail\n"); return 1; }
+
+    if (la) {  // --lora: адаптер инициализирован РАЗ в main, применяем к этому ctx
+        llama_adapter_lora * adapters[1] = { la }; float scales[1] = { 1.0f };
+        llama_set_adapters_lora(ctx, adapters, 1, scales);
+    }
+
+    auto sp = llama_sampler_chain_default_params();
+    llama_sampler * smpl = llama_sampler_chain_init(sp);
+    llama_sampler_chain_add(smpl, llama_sampler_init_greedy());
+
+    int n_past = 0;
+    // 1) decode промпта
+    {
+        llama_batch b = llama_batch_init(n_prompt, 0, 1);
+        for (int i = 0; i < n_prompt; i++) {
+            b.token[i] = toks[i]; b.pos[i] = n_past + i;
+            b.n_seq_id[i] = 1; b.seq_id[i][0] = 0;
+            b.logits[i] = (i == n_prompt - 1);
+        }
+        b.n_tokens = n_prompt;
+        if (llama_decode(ctx, b)) { fprintf(stderr, "decode prompt fail\n"); llama_batch_free(b); llama_sampler_free(smpl); llama_free(ctx); return 1; }
+        n_past += n_prompt;
+        llama_batch_free(b);
+    }
+    if (g_names) { llama_sampler_free(smpl); llama_free(ctx); return 0; }  // напечатали имена тензоров
+
+    if (g_lens) { printf("[lens] о чём Lumi думает СРАЗУ после вопроса (искренняя мысль перед латентами):\n"); print_lens(ctx, vocab, 0, 6); }
+
+    // 2) hidden (continuous thought)
+    std::vector<float> h(n_embd);
+    if (K > 0) {
+        if (!cbdata.got) { fprintf(stderr, "callback не поймал result_norm\n"); llama_sampler_free(smpl); llama_free(ctx); return 1; }
+        memcpy(h.data(), cbdata.h.data(), n_embd * sizeof(float));
+    }
+
+    // 3) K латентных шагов
+    for (int k = 0; k < K; k++) {
+        if (g_soft > 0) {
+            if (!compute_soft(ctx, vocab, &cbdata, n_embd, n_past, g_soft, h)) {
+                fprintf(stderr, "compute_soft fail at %d\n", k); llama_sampler_free(smpl); llama_free(ctx); return 1;
+            }
+        }
+        else if (g_scale > 0.0f) {
+            double nrm = 0.0; for (int j = 0; j < n_embd; j++) nrm += (double)h[j]*h[j];
+            nrm = nrm > 0 ? 1.0/ (double)sqrt(nrm) : 0.0;
+            for (int j = 0; j < n_embd; j++) h[j] = (float)(h[j]*nrm*g_scale);
+        }
+        llama_batch eb = llama_batch_init(1, n_embd, 1);
+        memcpy(eb.embd, h.data(), n_embd * sizeof(float));
+        eb.pos[0] = n_past; eb.n_seq_id[0] = 1; eb.seq_id[0][0] = 0; eb.logits[0] = true;
+        eb.n_tokens = 1;
+        if (llama_decode(ctx, eb)) { fprintf(stderr, "decode latent %d fail\n", k); llama_batch_free(eb); llama_sampler_free(smpl); llama_free(ctx); return 1; }
+        n_past++;
+        if (g_lens) print_lens(ctx, vocab, k + 1, 6);
+        memcpy(h.data(), cbdata.h.data(), n_embd * sizeof(float));
+        llama_batch_free(eb);
+    }
+
+    // 4) генерация ответа
+    if (g_lens) printf("[K=%d] (после %d латентных шагов думанья) ", K, K); else printf("[K=%d] ", K);
+    for (int t = 0; t < n_predict; t++) {
+        llama_token id = llama_sampler_sample(smpl, ctx, -1);
+        if (llama_vocab_is_eog(vocab, id)) break;
+        char buf[256];
+        int n = llama_token_to_piece(vocab, id, buf, sizeof(buf), 0, true);
+        if (n > 0) { fwrite(buf, 1, n, stdout); fflush(stdout); }
+        llama_batch b = llama_batch_init(1, 0, 1);
+        b.token[0] = id; b.pos[0] = n_past; b.n_seq_id[0] = 1; b.seq_id[0][0] = 0; b.logits[0] = true;
+        b.n_tokens = 1;
+        if (llama_decode(ctx, b)) { llama_batch_free(b); break; }
+        n_past++;
+        llama_batch_free(b);
+    }
+    printf("\n");
+
+    llama_sampler_free(smpl);
+    llama_free(ctx);
+    return 0;
 }
 
 int main(int argc, char ** argv) {
@@ -154,21 +263,20 @@ int main(int argc, char ** argv) {
         else if (a == "--soft" && i + 1 < argc) g_soft = std::stoi(argv[++i]);
         else if (a == "--raw") g_raw = 1;
         else if (a == "--lora" && i + 1 < argc) g_lora = argv[++i];
+        else if (a == "--prompts-file" && i + 1 < argc) g_prompts_file = argv[++i];
         else { prompt = a; for (++i; i < argc; i++) { prompt += " "; prompt += argv[i]; } break; }
     }
-    if (model_path.empty() || prompt.empty()) { usage(argv[0]); return 1; }
-    if (!g_raw) prompt = "<start_of_turn>user\n" + prompt + "<end_of_turn>\n<start_of_turn>model\n";  // gemma chat-wrap (если не --raw)
+    if (model_path.empty() || (prompt.empty() && g_prompts_file.empty())) { usage(argv[0]); return 1; }
 
     ggml_backend_load_all();
     llama_model_params mp = llama_model_default_params();
     mp.n_gpu_layers = ngl;
-    llama_model * model = llama_model_load_from_file(model_path.c_str(), mp);
+    llama_model * model = llama_model_load_from_file(model_path.c_str(), mp);  // РАЗ
     if (!model) { fprintf(stderr, "load fail\n"); return 1; }
     const llama_vocab * vocab = llama_model_get_vocab(model);
     const int n_embd = llama_model_n_embd(model);
 
-    // токен-id цифр '0'..'9' для дампа heatmap (берём последний токен токенизации цифры)
-    if (g_dump) {
+    if (g_dump) {  // токен-id цифр для heatmap-дампа
         g_digit_ids.resize(10);
         for (int d = 0; d < 10; d++) {
             std::string ds(1, char('0' + d));
@@ -178,111 +286,38 @@ int main(int argc, char ** argv) {
         }
     }
 
-    // tokenize
-    int n_prompt = -llama_tokenize(vocab, prompt.c_str(), prompt.size(), NULL, 0, true, true);
-    std::vector<llama_token> toks(n_prompt);
-    if (llama_tokenize(vocab, prompt.c_str(), prompt.size(), toks.data(), toks.size(), true, true) < 0) {
-        fprintf(stderr, "tok fail\n"); return 1;
-    }
-
-    // ctx: embeddings=true + pooling NONE → get_embeddings_ith отдаёт per-token hidden (continuous thought)
-    llama_context_params cp = llama_context_default_params();
-    cp.n_ctx   = n_prompt + K + n_predict + 8;
-    cp.n_batch = n_prompt + 8;
-    cp.embeddings    = false;                    // генерация чистая; hidden берём через callback (не embeddings-режим)
-    cp.pooling_type  = LLAMA_POOLING_TYPE_UNSPECIFIED;
-    g_nembd = n_embd;
-    static CocoCB cbdata; cbdata.h.resize(n_embd); cbdata.n_embd = n_embd; cbdata.got = false;
-    cbdata.embd_capture = false; cbdata.embd_got = false; cbdata.embd_k = 0;
-    if (g_names)     { cp.cb_eval = names_cb;   cp.cb_eval_user_data = nullptr; }   // debug: печать имён тензоров
-    else if (K > 0)  { cp.cb_eval = capture_cb; cp.cb_eval_user_data = &cbdata; }   // K>0: ловить result_norm
-    llama_context * ctx = llama_init_from_model(model, cp);
-    if (!ctx) { fprintf(stderr, "ctx fail\n"); return 1; }
-
-    // --lora: применить адаптер (тест пути A — обученные веса + латенты)
+    // --lora: адаптер инициализируем РАЗ (на модели), применяем к каждому per-prompt ctx внутри run_one
+    llama_adapter_lora * la = nullptr;
     if (!g_lora.empty()) {
-        llama_adapter_lora * la = llama_adapter_lora_init(model, g_lora.c_str());
-        if (!la) { fprintf(stderr, "lora load fail: %s\n", g_lora.c_str()); return 1; }
-        llama_adapter_lora * adapters[1] = { la }; float scales[1] = { 1.0f };
-        llama_set_adapters_lora(ctx, adapters, 1, scales);
+        la = llama_adapter_lora_init(model, g_lora.c_str());
+        if (!la) { fprintf(stderr, "lora load fail: %s\n", g_lora.c_str()); llama_model_free(model); return 1; }
         fprintf(stderr, "[lora] applied: %s\n", g_lora.c_str());
     }
 
-    auto sp = llama_sampler_chain_default_params();
-    llama_sampler * smpl = llama_sampler_chain_init(sp);
-    llama_sampler_chain_add(smpl, llama_sampler_init_greedy());
-
-    int n_past = 0;
-    // 1) decode промпта (явные позиции через batch_init для консистентности с embd-шагами)
-    {
-        llama_batch b = llama_batch_init(n_prompt, 0, 1);
-        for (int i = 0; i < n_prompt; i++) {
-            b.token[i] = toks[i]; b.pos[i] = n_past + i;
-            b.n_seq_id[i] = 1; b.seq_id[i][0] = 0;
-            b.logits[i] = (i == n_prompt - 1);
+    // собрать список промптов: из --prompts-file (по 1 на строку) ИЛИ единичный CLI-промпт
+    std::vector<std::string> prompts;
+    if (!g_prompts_file.empty()) {
+        FILE * pf = fopen(g_prompts_file.c_str(), "r");
+        if (!pf) { fprintf(stderr, "prompts-file open fail: %s\n", g_prompts_file.c_str()); llama_model_free(model); return 1; }  // la leak-at-exit безвреден
+        char line[8192];
+        while (fgets(line, sizeof(line), pf)) {
+            std::string s(line);
+            while (!s.empty() && (s.back() == '\n' || s.back() == '\r')) s.pop_back();
+            if (!s.empty()) prompts.push_back(s);
         }
-        b.n_tokens = n_prompt;
-        if (llama_decode(ctx, b)) { fprintf(stderr, "decode prompt fail\n"); return 1; }
-        n_past += n_prompt;
-        llama_batch_free(b);
-    }
-    if (g_names) { llama_free(ctx); llama_model_free(model); return 0; }  // напечатали имена тензоров — выход
-
-    // logit-lens на hidden ПРОМПТА: искренняя «мысль» модели сразу после прочтения вопроса (до латентного дрейфа)
-    if (g_lens) { printf("[lens] о чём Lumi думает СРАЗУ после вопроса (искренняя мысль перед латентами):\n"); print_lens(ctx, vocab, 0, 6); }
-
-    // 2) hidden (continuous thought) — callback УЖЕ поймал result_norm последней позиции в cbdata.h
-    std::vector<float> h(n_embd);
-    if (K > 0) {
-        if (!cbdata.got) { fprintf(stderr, "callback не поймал result_norm\n"); return 1; }
-        memcpy(h.data(), cbdata.h.data(), n_embd * sizeof(float));
+        fclose(pf);
+    } else {
+        prompts.push_back(prompt);
     }
 
-    // 3) K латентных шагов: подаём hidden обратно ВХОДОМ через batch.embd (БЕЗ сэмпла токена)
-    for (int k = 0; k < K; k++) {
-        // soft-token: вместо сырого result_norm подаём Σ p_i·embd(top-K) — в input-распределении (не OOD)
-        if (g_soft > 0) {
-            if (!compute_soft(ctx, vocab, &cbdata, n_embd, n_past, g_soft, h)) {
-                fprintf(stderr, "compute_soft fail at %d\n", k); return 1;
-            }
-        }
-        // опц. нормализация масштаба hidden под input-эмбеддинг (--scale S: L2-норм → ×S); для soft не нужно
-        else if (g_scale > 0.0f) {
-            double nrm = 0.0; for (int j = 0; j < n_embd; j++) nrm += (double)h[j]*h[j];
-            nrm = nrm > 0 ? 1.0/ (double)sqrt(nrm) : 0.0;
-            for (int j = 0; j < n_embd; j++) h[j] = (float)(h[j]*nrm*g_scale);
-        }
-        llama_batch eb = llama_batch_init(1, n_embd, 1);
-        memcpy(eb.embd, h.data(), n_embd * sizeof(float));
-        eb.pos[0] = n_past; eb.n_seq_id[0] = 1; eb.seq_id[0][0] = 0; eb.logits[0] = true;
-        eb.n_tokens = 1;
-        if (llama_decode(ctx, eb)) { fprintf(stderr, "decode latent %d fail\n", k); return 1; }
-        n_past++;
-        if (g_lens) print_lens(ctx, vocab, k + 1, 6);  // logit-lens: о чём думает модель в этом латенте
-        memcpy(h.data(), cbdata.h.data(), n_embd * sizeof(float));  // callback обновил result_norm после decode
-        llama_batch_free(eb);
+    int rc = 0;
+    for (const std::string & p : prompts) {
+        int r = run_one(model, vocab, n_embd, p, K, n_predict, la);
+        if (r) rc = r;
+        if (g_names) break;  // --names = одноразовый debug, не батчим
     }
-
-    // 4) генерация ответа токенами от текущего состояния KV
-    if (g_lens) printf("[K=%d] (после %d латентных шагов думанья) ", K, K); else printf("[K=%d] ", K);
-    for (int t = 0; t < n_predict; t++) {
-        llama_token id = llama_sampler_sample(smpl, ctx, -1);
-        if (llama_vocab_is_eog(vocab, id)) break;
-        char buf[256];
-        int n = llama_token_to_piece(vocab, id, buf, sizeof(buf), 0, true);
-        if (n > 0) { fwrite(buf, 1, n, stdout); fflush(stdout); }
-        llama_batch b = llama_batch_init(1, 0, 1);
-        b.token[0] = id; b.pos[0] = n_past; b.n_seq_id[0] = 1; b.seq_id[0][0] = 0; b.logits[0] = true;
-        b.n_tokens = 1;
-        if (llama_decode(ctx, b)) { llama_batch_free(b); break; }
-        n_past++;
-        llama_batch_free(b);
-    }
-    printf("\n");
 
     if (g_dump) fclose(g_dump);
-    llama_sampler_free(smpl);
-    llama_free(ctx);
-    llama_model_free(model);
-    return 0;
+    llama_model_free(model);  // la (адаптер) leak-at-exit безвреден (init-раз, как в оригинале)
+    return rc;
 }

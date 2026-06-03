@@ -1605,7 +1605,8 @@ ggml_tensor * llm_graph_context::build_inp_embd(ggml_tensor * tok_embd) const {
         const char * coco_fuse_env = getenv("LLAMA_COCONUT_FUSE_ALPHA");
         if (coco_fuse_env) {
             const float coco_a = (float) atof(coco_fuse_env);
-            ggml_tensor * e_pred = ggml_cont(ctx0, ggml_view_2d(ctx0, cur, cur->ne[0], 1,
+            // e_pred = колонка dst_pos из cur с n_embd(=lat) рядами (матч lat-шейпа; безопасно при n_embd_inp != n_embd).
+            ggml_tensor * e_pred = ggml_cont(ctx0, ggml_view_2d(ctx0, cur, g_coco_lat_node->ne[0], 1,
                                              cur->nb[1], (size_t) g_coco_lat_node_pos * cur->nb[1]));
             lat = ggml_add(ctx0, ggml_scale(ctx0, ggml_cont(ctx0, lat), coco_a),
                                  ggml_scale(ctx0, e_pred, 1.0f - coco_a));

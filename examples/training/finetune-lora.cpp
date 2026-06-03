@@ -633,7 +633,7 @@ static bool parse_finetune_args(int& argc, char** argv, finetune_params& ft_para
 static float coconut_curriculum_alpha(int epoch, int num_epochs) {
     if (num_epochs <= 1) return 0.5f;                          // 1 эпоха → сразу fusion-значение
     const float frac = (float) epoch / (float) (num_epochs - 1);  // 0..1 по эпохам
-    const float a_warm = 1.0f;   // warm-up: чистый контекст (латент выкл)
+    const float a_warm = 0.95f;  // warm-up: почти чистый контекст (НЕ ровно 1.0 — α=1.0-на-real untested; cap избегает edge)
     const float a_fuse = 0.5f;   // fusion-плато (LTT)
     const float warm_frac = 0.2f;                              // первые ~20% эпох держим warm
     if (frac <= warm_frac) return a_warm;

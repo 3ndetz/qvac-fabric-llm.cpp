@@ -56,6 +56,10 @@ extern "C" {
             int64_t        ndata_shard); // number of datapoints/labels per shard
     GGML_API void ggml_opt_dataset_free(ggml_opt_dataset_t dataset);
 
+    // GRPO/REINFORCE: scale the loss (and its gradient) by a signed advantage. >0 reinforce,
+    // <0 negative push (ascent, unlearn). Set before ggml_opt_init/llama_opt_init. Reset to 1.0.
+    GGML_API void ggml_opt_set_loss_scale(float scale);
+
     // get underlying tensors that store the data
     GGML_API int64_t              ggml_opt_dataset_ndata (ggml_opt_dataset_t dataset);
     GGML_API struct ggml_tensor * ggml_opt_dataset_data  (ggml_opt_dataset_t dataset); // shape = [ne_datapoint, ndata]

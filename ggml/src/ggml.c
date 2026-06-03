@@ -3344,7 +3344,13 @@ static struct ggml_tensor * ggml_scale_impl(
         float                 s,
         float                 b,
         bool                  inplace) {
-    GGML_ASSERT(ggml_is_padded_1d(a));
+    // BUGFIX (lumi): scale required a padded_1d tensor, but gemma3n altup backward feeds
+    // a transposed (non-contiguous) grad ("grad for all_coefs", op=TRANSPOSE). Make it
+    // contiguous instead of asserting. Safe: backward builds with inplace=false.
+    if (!ggml_is_padded_1d(a)) {
+        GGML_ASSERT(!inplace && "cannot in-place scale a non-contiguous tensor");
+        a = ggml_cont(ctx, a);
+    }
 
     struct ggml_tensor * result = inplace ? ggml_view_tensor(ctx, a) : ggml_dup_tensor(ctx, a);
 
@@ -6479,7 +6485,13 @@ static void ggml_compute_backward(
                 ggml_add_or_set(ctx, cgraph, isrc0, grad);
             }
             if (src1_needs_grads) {
-                ggml_sub_or_set(ctx, cgraph, isrc1, grad);
+                // BUGFIX (lumi): un-broadcast grad to src1 shape (gemma3n altup SUB with
+                // broadcast operand) — same gap as DIV had; ADD/MUL already do this.
+                struct ggml_tensor * tmp = grad;
+                if (!ggml_are_same_shape(src0, src1)) {
+                    tmp = ggml_repeat_back(ctx, tmp, src1);
+                }
+                ggml_sub_or_set(ctx, cgraph, isrc1, tmp);
             }
         } break;
         case GGML_OP_MUL: {
@@ -6499,7 +6511,34 @@ static void ggml_compute_backward(
                 ggml_add_or_set(ctx, cgraph, isrc0, ggml_div(ctx, grad, src1));
             }
             if (src1_needs_grads) {
-                ggml_sub_or_set(ctx, cgraph, isrc1, ggml_mul(ctx, grad, ggml_div(ctx, tensor, src1)));
+                // d(x/y)/dy = -x/y^2 = -(x/y)/y = -tensor/src1, times grad.
+                // BUGFIX (lumi): when src1 is broadcast (e.g. gemma3n altup_unembd DIV with
+                // divisor [1,N,..] vs [2048,N,..]), the grad must be reduced back to src1's
+                // shape — exactly like ADD/MUL above do. Without repeat_back the grad keeps
+                // the broadcasted shape and the backward shape-assert fires (blocked v5 train).
+                struct ggml_tensor * tmp = ggml_mul(ctx, grad, ggml_div(ctx, tensor, src1));
+                if (!ggml_are_same_shape(src0, src1)) {
+                    tmp = ggml_repeat_back(ctx, tmp, src1);
+                }
+                ggml_sub_or_set(ctx, cgraph, isrc1, tmp);
+            }
+        } break;
+        case GGML_OP_CONCAT: {
+            // BUGFIX (lumi): backward for concat was unimplemented — gemma3n altup uses it.
+            // grad is split back to each source along the concat dim via views.
+            const int dim = ((const int32_t *) tensor->op_params)[0];
+            if (src0_needs_grads) {
+                struct ggml_tensor * g0 = ggml_view_4d(ctx, grad,
+                    src0->ne[0], src0->ne[1], src0->ne[2], src0->ne[3],
+                    grad->nb[1], grad->nb[2], grad->nb[3], 0);
+                ggml_add_or_set(ctx, cgraph, isrc0, ggml_cont(ctx, g0));
+            }
+            if (src1_needs_grads) {
+                const size_t offset = (size_t) src0->ne[dim] * grad->nb[dim];
+                struct ggml_tensor * g1 = ggml_view_4d(ctx, grad,
+                    src1->ne[0], src1->ne[1], src1->ne[2], src1->ne[3],
+                    grad->nb[1], grad->nb[2], grad->nb[3], offset);
+                ggml_add_or_set(ctx, cgraph, isrc1, ggml_cont(ctx, g1));
             }
         } break;
         case GGML_OP_SQR: {
@@ -6539,7 +6578,11 @@ static void ggml_compute_backward(
         } break;
         case GGML_OP_MEAN: {
             if (src0_needs_grads) {
-                ggml_add1_or_set(ctx, cgraph, isrc0, ggml_scale_impl(ctx, grad, 1.0f/src0->ne[0], 0.0, false));
+                // BUGFIX (lumi): mean reduces dim0 → grad is [1,ne1,ne2,ne3], NOT scalar, so
+                // add1 (scalar-only) asserted. Broadcast the scaled grad back over dim0 like
+                // SUM_ROWS does. (gemma3n RMS-norm uses mean-of-squares over a multi-dim tensor.)
+                ggml_add_or_set(ctx, cgraph, isrc0,
+                    ggml_repeat(ctx, ggml_scale_impl(ctx, grad, 1.0f/src0->ne[0], 0.0, false), src0));
             }
         } break;
         case GGML_OP_REPEAT: {
@@ -6939,6 +6982,15 @@ static void ggml_compute_backward(
         } //break;
     }
 
+    // DIAG (lumi): pinpoint which op's backward produces a wrong grad shape on the
+    // correct gemma3n 2048-attn graph (v5). Logs op + shapes before aborting.
+    if (src1_needs_grads && !ggml_are_same_shape(src1, cgraph->grads[isrc1])) {
+        struct ggml_tensor * g = cgraph->grads[isrc1];
+        fprintf(stderr, "[LUMI-DIAG] backward shape mismatch: op=%s name=%s | src1=[%ld,%ld,%ld,%ld] grad=[%ld,%ld,%ld,%ld]\n",
+                ggml_op_name(tensor->op), tensor->name ? tensor->name : "?",
+                (long)src1->ne[0],(long)src1->ne[1],(long)src1->ne[2],(long)src1->ne[3],
+                g?(long)g->ne[0]:-1, g?(long)g->ne[1]:-1, g?(long)g->ne[2]:-1, g?(long)g->ne[3]:-1);
+    }
     GGML_ASSERT(!src0_needs_grads || ggml_are_same_shape(src0, cgraph->grads[isrc0]));
     GGML_ASSERT(!src1_needs_grads || ggml_are_same_shape(src1, cgraph->grads[isrc1]));
     GGML_ASSERT(!src2_needs_grads || ggml_are_same_shape(src2, cgraph->grads[isrc2]));

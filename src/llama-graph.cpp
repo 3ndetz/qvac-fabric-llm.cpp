@@ -1598,6 +1598,18 @@ ggml_tensor * llm_graph_context::build_inp_embd(ggml_tensor * tok_embd) const {
         // вьюшим колонку src_pos из result_norm [n_embd, n_tokens] → [n_embd, 1], инъектим в dst_pos
         ggml_tensor * lat = ggml_view_2d(ctx0, g_coco_lat_node, g_coco_lat_node->ne[0], 1,
                                          g_coco_lat_node->nb[1], (size_t) g_coco_lat_node_src * g_coco_lat_node->nb[1]);
+        // ★ §6 LTT-fusion (arXiv 2602.10229): e_fusion = α·h_ctx + (1-α)·e_pred — мост output-hidden↔input-embedding
+        // manifold, фикс коллапса НАИВНОЙ инъекции (Path A k1=0% = manifold mismatch: result_norm hidden ≠ embd-пространство).
+        // e_pred = существующий embd на dst_pos (= tok_embd ответ-токена при трене). env LLAMA_COCONUT_FUSE_ALPHA задаёт α;
+        // НЕТ env → старая raw-инъекция (бэк-совместимо, дефолт-путь не меняется). См. [[latent_collapse_manifold_fix_2026]].
+        const char * coco_fuse_env = getenv("LLAMA_COCONUT_FUSE_ALPHA");
+        if (coco_fuse_env) {
+            const float coco_a = (float) atof(coco_fuse_env);
+            ggml_tensor * e_pred = ggml_cont(ctx0, ggml_view_2d(ctx0, cur, cur->ne[0], 1,
+                                             cur->nb[1], (size_t) g_coco_lat_node_pos * cur->nb[1]));
+            lat = ggml_add(ctx0, ggml_scale(ctx0, ggml_cont(ctx0, lat), coco_a),
+                                 ggml_scale(ctx0, e_pred, 1.0f - coco_a));
+        }
         cur = ggml_set_2d(ctx0, cur, lat, cur->nb[1], (size_t) g_coco_lat_node_pos * cur->nb[1]);
     } else
     // Coconut путь A (ИНК-2 detached): перезаписать одну позицию captured-латентом (result_norm).

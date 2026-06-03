@@ -13,6 +13,12 @@
 #include <random>
 #include <vector>
 
+// GRPO/REINFORCE hook: signed advantage applied to the WHOLE loss (gradient sign+magnitude).
+// >0 → descent (reinforce correct), <0 → ascent (unlearn wrong = negative push). alpha stays >0
+// (AdamW asserts alpha>0), so the sign lives here. Adam normalizes step size → few epochs bounded.
+static float g_opt_loss_scale = 1.0f;
+void ggml_opt_set_loss_scale(float s) { g_opt_loss_scale = s; }
+
 struct ggml_opt_dataset {
     struct ggml_context   * ctx    = nullptr;
     ggml_backend_buffer_t   buf    = nullptr;
@@ -536,6 +542,12 @@ static void ggml_opt_build(ggml_opt_context_t opt_ctx) {
             opt_ctx->loss_per_datapoint = true;
             break;
         }
+    }
+    // GRPO signed-advantage: scale the loss (and thus its gradient) by the advantage. Negative →
+    // ascent (negative push on wrong samples). Identity at 1.0 (default, backward-compatible).
+    if (g_opt_loss_scale != 1.0f) {
+        opt_ctx->loss = ggml_scale(ctx_results, opt_ctx->loss, g_opt_loss_scale);
+        ggml_set_name(opt_ctx->loss, "loss_advantage_scaled");
     }
     ggml_set_output(opt_ctx->loss);
     ggml_set_loss(opt_ctx->loss);

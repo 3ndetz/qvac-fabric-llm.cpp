@@ -206,7 +206,11 @@ struct llama_adapter_lora * llama_lora_create_adapter(
                 (is_blk && (params->target_modules & LLAMA_LORA_TARGET_FFN_DOWN)  && tensor_name.find("ffn_down")    != std::string::npos) ||
                 (          (params->target_modules & LLAMA_LORA_TARGET_OUTPUT)     && tensor_name.find("output")      != std::string::npos);
 
-            if (should_create_lora && base_tensor->ne[1] > 0) {
+            // ne[1] > 1 → only 2D weight matrices. Excludes 1D RMSNorm scales
+            // (attn_q_norm/attn_k_norm): the loose substring match "attn_q" also
+            // catches "attn_q_norm", and a LoRA on a 1D norm is meaningless AND its
+            // backward grad-shape asserts on some converted gemma3n GGUFs (v5 merged).
+            if (should_create_lora && base_tensor->ne[1] > 1) {
                 struct ggml_tensor * lora_a = nullptr;
                 struct ggml_tensor * lora_b = nullptr;
 

@@ -626,6 +626,31 @@ static bool parse_finetune_args(int& argc, char** argv, finetune_params& ft_para
     return true;
 }
 
+// curriculum-Coconut (LTT 2602.10229): постепенный переход CoT→латент по эпохам.
+// α = доля КОНТЕКСТА в латент-fusion (build_inp_embd: α·h_ctx + (1-α)·e_pred):
+//   α=1 = чистый CoT (латент выключен), α→0.5 = половина латента (LTT-значение).
+// Gated env LLAMA_COCONUT_CURRICULUM (нет env = НЕТ кривой = старое поведение, backward-compat).
+static float coconut_curriculum_alpha(int epoch, int num_epochs) {
+    if (num_epochs <= 1) return 0.5f;                          // 1 эпоха → сразу fusion-значение
+    const float frac = (float) epoch / (float) (num_epochs - 1);  // 0..1 по эпохам
+    const float a_warm = 1.0f;   // warm-up: чистый контекст (латент выкл)
+    const float a_fuse = 0.5f;   // fusion-плато (LTT)
+    const float warm_frac = 0.2f;                              // первые ~20% эпох держим warm
+    if (frac <= warm_frac) return a_warm;
+    const float p = (frac - warm_frac) / (1.0f - warm_frac);   // 0..1 после warm
+    return a_warm + (a_fuse - a_warm) * p;                     // линейно 1.0→0.5
+}
+
+static void coconut_set_fuse_alpha_env(float a) {
+    char buf[32];
+    snprintf(buf, sizeof(buf), "%.4f", a);
+#ifdef _WIN32
+    _putenv_s("LLAMA_COCONUT_FUSE_ALPHA", buf);
+#else
+    setenv("LLAMA_COCONUT_FUSE_ALPHA", buf, 1);
+#endif
+}
+
 int main(int argc, char ** argv) {
     common_params params;
     finetune_params ft_params;
@@ -945,7 +970,15 @@ int main(int argc, char ** argv) {
         }
         LOG_INF("Starting epoch %d (step %lld, lr=%.4e)\n", epoch, (long long)cb_data.global_step, cb_data.learning_rate);
         cb_data.current_epoch = epoch;
-        
+
+        // curriculum-Coconut: варьируем латент-fusion α по эпохам (gated, backward-compat).
+        // Граф (build_inp_embd) getenv'ит LLAMA_COCONUT_FUSE_ALPHA per-build → подхватывает per-epoch α.
+        if (getenv("LLAMA_COCONUT_CURRICULUM")) {
+            const float coco_a = coconut_curriculum_alpha(epoch, ft_params.num_epochs);
+            coconut_set_fuse_alpha_env(coco_a);
+            LOG_INF("curriculum-Coconut: epoch %d/%d → FUSE_ALPHA=%.4f\n", epoch, ft_params.num_epochs, coco_a);
+        }
+
         int64_t resume_batch = 0;
         if (start_step > 0 && epoch == start_epoch) {
             resume_batch = start_step % training_batches_per_epoch;
